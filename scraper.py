@@ -1,6 +1,8 @@
 import pandas as pd
 import seaborn as sns
 import requests
+import requests.auth
+from requests.adapters import HTTPAdapter
 from bs4 import BeautifulSoup
 from selenium import webdriver
 from selenium.webdriver.common.by import By
@@ -10,8 +12,15 @@ from webdriver_manager.chrome import ChromeDriverManager
 import praw
 import pickle
 import time
-import datetime
+import urllib, json
+from urllib3.util import Retry
+from datetime import timedelta
 
+
+def save_pickle(file_name,obj):
+    with open(file_name, 'wb') as handle:
+        pickle.dump(obj, handle, protocol=pickle.HIGHEST_PROTOCOL)
+    return file_name + ' is saved'
 
 def open_pickle(file_name):
     with open(file_name, 'rb') as handle:
@@ -24,7 +33,17 @@ def get_credentials(path):
          cred = pickle.load(handle)
     
     return cred
-    
+
+def get_access_token_headers(credentials):
+    client_auth = requests.auth.HTTPBasicAuth(credentials['client_id'], 
+                                              credentials['client_secret'])
+    post_data = {"grant_type": "password", "username": credentials['username'],
+                 "password": credentials['password']}
+    headers = {"User-Agent": credentials['user_agent']}
+    response = requests.post("https://www.reddit.com/api/v1/access_token", auth=client_auth, data=post_data, headers=headers)
+    token = 'bearer '+response.json()['access_token']
+    return {"Authorization": token, "User-Agent": credentials['user_agent']}
+
     
 def retrieve_comment_and_post_count(reddit_data_dict,subreddit):
     lookback_hours = 24
@@ -59,6 +78,52 @@ def retrieve_comment_and_post_count(reddit_data_dict,subreddit):
                 reddit_data_dict[stats[stat]].append(count)
                 break
 
+
+def requests_retry_session(retries=3,
+                           backoff_factor=0.3,
+                           status_forcelist=(500, 502, 503, 504),
+                           session=None,):
+    session = session or requests.Session()
+    retry = Retry(total=retries,
+                  read=retries,
+                  connect=retries,
+                  backoff_factor=backoff_factor,
+                  status_forcelist=status_forcelist,)
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount('http://', adapter)
+    session.mount('https://', adapter)
+    return session
+
+
+def call_api(url, headers,payload={}, timeout=10):
+    
+    try:
+        response = requests_retry_session().get(url, headers=headers,
+                                              params=payload, timeout=timeout)
+        response.encoding = 'utf-8'
+        if response.status_code != 401:
+            response.raise_for_status()
+    except (requests.exceptions.Timeout, requests.exceptions.HTTPError):
+        logger.error("Error calling api with payload %s", payload, exc_info=True)
+        raise Exception('API response: {}'.format(response.status_code))
+    return response
+
+def add_data_to_dict(reddit_data_dict,time_stamp,sub,file_name,headers):
+    #rate limit is one request per second (60 requests per min)
+    start_time = time.time()
+    subreddit = call_api(f"https://oauth.reddit.com/r/{sub}/about", headers, payload={}, timeout=10)
+    reddit_data_dict['date'].append(current_timestamp)
+    reddit_data_dict['title'].append(subreddit.json()['data']['title'])
+    reddit_data_dict['id'].append(subreddit.json()['data']['id'])
+    reddit_data_dict['subscribers'].append(subreddit.json()['data']['subscribers'])
+    retrieve_comment_and_post_count(reddit_data_dict,sub)
+    
+    save_pickle(file_name, reddit_data_dict)
+    sleep_time = 5 - (time.time() - start_time)
+    if sleep_time < 0:
+        sleep_time = 0.5
+    time.sleep(sleep_time)
+
 def parse_recent_activity(current_timestamp, credentials, subreddit_names):
     now = datetime.datetime.now().strftime("%Y_%m_%d")
     file_name = 'subreddit_scrape_' + now + '_dict.pkl'
@@ -72,31 +137,30 @@ def parse_recent_activity(current_timestamp, credentials, subreddit_names):
         'num_of_posts':[] 
     }
     
-    reddit = praw.Reddit(client_id=credentials['client_id'],
-                     client_secret=credentials['client_secret'],
-                     user_agent=credentials['user_agent'],
-                     username=credentials['username'],
-                     password=credentials['password'])
     
+    auth_header = get_access_token_headers(credentials)
+    
+    skipped = []
+    
+    c = 0
     for sub in subreddit_names:
-        print(sub)
-        #rate limit is one request per second (60 requests per min)
-        start_time = time.time()
-        subreddit = reddit.subreddit(sub)
-        reddit_data['date'].append(current_timestamp)
-        reddit_data['title'].append(subreddit.title)
-        reddit_data['id'].append(subreddit.id)
-        reddit_data['subscribers'].append(subreddit.subscribers)
-        retrieve_comment_and_post_count(reddit_data,subreddit)
-        save_pickle(file_name, reddit_data)
-        sleep_time = 2 - (time.time() - start_time)
-        if sleep_time < 0:
-            sleep_time = 0.25
-        time.sleep(sleep_time)
+        
+        c += 1
+        try:
+            print(sub)
+            add_data_to_dict(reddit_data,current_timestamp,sub,file_name,auth_header)
+            
+            if c == 1000:
+                c = 0
+                get_access_token_headers(path)
+        except Exception as err:
+            print(err)
+            skipped.append(sub)
+            save_pickle('skipped_'+file_name, skipped)
+            pass
         
         
     return reddit_data
-
 
 
 
@@ -106,6 +170,7 @@ current_timestamp = now.strftime("%Y-%m-%d")
 credentials = get_credentials('reddit_credentials.pkl')
 
 df = open_pickle('data/game_and_subreddit_pairing_05072020.pkl')
-subreddit_names = df['subreddit'].unique()
 
-parse_recent_activity(current_timestamp, credentials, subreddit_names)
+subreddit_names = df['subreddit']
+
+parse_recent_activity(current_timestamp, credentials, subreddit_names.unique())
