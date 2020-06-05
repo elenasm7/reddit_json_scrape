@@ -15,6 +15,9 @@ import time
 import urllib, json
 from urllib3.util import Retry
 from datetime import timedelta
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 def save_pickle(file_name,obj):
